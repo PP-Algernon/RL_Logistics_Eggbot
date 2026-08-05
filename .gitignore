@@ -35,3 +35,5 @@ _build
 .lastformat
 USDs/local_mqesacg6_zegsvn_mjcf_stl.zip
 USDs/local_mqesacg6_zegsvn_urdf_stl.zip
+
+.vscode/browse.vc.db*
