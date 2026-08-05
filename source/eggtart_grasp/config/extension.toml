@@ -1,0 +1,26 @@
+[package]
+
+# Semantic Versioning is used: https://semver.org/
+version = "0.1.0"
+
+# Description
+category = "isaaclab"
+readme  = "README.md"
+
+title = "Eggtart Mobile Grasp"
+author = "Eggtart Logistics Robot Project"
+maintainer = "Eggtart Logistics Robot Project"
+description = "Isaac Lab extension: Mecanum-wheeled mobile manipulator grasping a moving target"
+repository = ""
+keywords = ["extension", "isaaclab", "mobile-manipulation", "grasp", "mecanum"]
+
+[dependencies]
+"isaaclab" = {}
+"isaaclab_assets" = {}
+"isaaclab_mimic" = {}
+"isaaclab_rl" = {}
+"isaaclab_tasks" = {}
+# NOTE: Add additional dependencies here
+
+[[python.module]]
+name = "eggtart_grasp"
