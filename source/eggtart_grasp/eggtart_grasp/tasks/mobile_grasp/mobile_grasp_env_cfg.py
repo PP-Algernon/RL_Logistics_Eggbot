@@ -21,6 +21,7 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.scene import InteractiveSceneCfg
+from isaaclab.sensors import CameraCfg, patterns
 from isaaclab.utils import configclass
 from isaaclab.utils.noise import AdditiveUniformNoiseCfg as Unoise
 
@@ -77,6 +78,26 @@ class MobileGraspSceneCfg(InteractiveSceneCfg):
         spawn=sim_utils.DomeLightCfg(color=(0.75, 0.75, 0.75), intensity=2500.0),
     )
 
+    # wrist-mounted camera for visual observations
+    wrist_camera = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Robot/link_005/WristCamera",
+        update_period=0.1,  # 10Hz camera update
+        height=84,
+        width=84,
+        data_types=["rgb", "distance_to_camera"],
+        spawn=sim_utils.PinholeCameraCfg(
+            focal_length=24.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.1, 1.0e5),
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.05, 0.0, 0.02),  # slightly forward from wrist
+            rot=(0.707, 0.0, 0.0, 0.707),  # looking forward (90deg pitch)
+            convention="ros",
+        ),
+    )
+
 
 ##
 # MDP settings
@@ -131,10 +152,19 @@ class ObservationsCfg:
             func=mdp.target_lin_vel_w, params={"target_cfg": SceneEntityCfg("target")}
         )
         actions = ObsTerm(func=mdp.last_action)
+        # visual observations (RGB + Depth from wrist camera)
+        camera_rgb = ObsTerm(
+            func=mdp.camera_rgb,
+            params={"sensor_cfg": SceneEntityCfg("wrist_camera")},
+        )
+        camera_depth = ObsTerm(
+            func=mdp.camera_depth,
+            params={"sensor_cfg": SceneEntityCfg("wrist_camera")},
+        )
 
         def __post_init__(self):
             self.enable_corruption = True
-            self.concatenate_terms = True
+            self.concatenate_terms = False  # Changed: keep images separate for CNN processing
 
     policy: PolicyCfg = PolicyCfg()
 

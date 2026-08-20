@@ -12,6 +12,7 @@ import torch
 
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.sensors import Camera
 from isaaclab.utils.math import subtract_frame_transforms
 
 if TYPE_CHECKING:
@@ -60,3 +61,30 @@ def target_lin_vel_w(
     """World-frame linear velocity of the target. Shape (N, 3)."""
     target: RigidObject = env.scene[target_cfg.name]
     return target.data.root_lin_vel_w
+
+
+def camera_rgb(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_camera"),
+) -> torch.Tensor:
+    """RGB image from camera. Shape (N, H, W, 3)."""
+    camera: Camera = env.scene.sensors[sensor_cfg.name]
+    # Get RGB data and normalize to [0, 1]
+    rgb_data = camera.data.output["rgb"]  # Shape: (N, H, W, 3) or (N, H, W, 4) with alpha
+    # Remove alpha channel if present
+    if rgb_data.shape[-1] == 4:
+        rgb_data = rgb_data[..., :3]
+    return rgb_data
+
+
+def camera_depth(
+    env: ManagerBasedRLEnv,
+    sensor_cfg: SceneEntityCfg = SceneEntityCfg("wrist_camera"),
+) -> torch.Tensor:
+    """Depth image from camera. Shape (N, H, W, 1)."""
+    camera: Camera = env.scene.sensors[sensor_cfg.name]
+    depth_data = camera.data.output["distance_to_camera"]
+    # Add channel dimension if not present
+    if len(depth_data.shape) == 3:
+        depth_data = depth_data.unsqueeze(-1)
+    return depth_data
