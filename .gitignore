@@ -13,7 +13,6 @@
 # IDE
 **/.idea/
 **/.claude/
-**/.vscode/
 
 # Outputs
 **/runs/*
