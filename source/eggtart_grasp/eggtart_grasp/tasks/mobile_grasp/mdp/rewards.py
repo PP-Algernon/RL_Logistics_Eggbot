@@ -1,15 +1,20 @@
-"""Staged reward terms for the Eggtart mobile-grasp task.
+"""Eggtart 移动抓取任务的分阶段奖励项
 
-Stage shaping (all dense unless noted):
-  1. ``base_to_target_xy_tanh``  -- drive the base toward the target (horizontal plane)
-  2. ``ee_to_target_tanh``       -- reach the end-effector to the target
-  3. ``grasp_bonus``             -- sparse-ish bonus when the EE is close AND the gripper is closed
-  4. ``retract_bonus``           -- once "grasping", reward pulling the arm back to its home pose
+阶段设计（除特殊说明外均为稠密奖励）：
+  1. ``base_to_target_xy_tanh``  -- 引导底盘在水平面接近目标
+  2. ``base_facing_target``      -- 引导底盘正面朝向目标
+  3. ``ee_to_target_tanh``       -- 引导末端执行器到达目标
+  4. ``grasp_bonus``             -- 当末端执行器接近目标且夹爪闭合时给予稀疏奖励
+  4'. ``grasp_bonus_dwell``      -- 同上，但要求**连续停留**一段时间后闭爪才算（治夹早）
+  5. ``retract_bonus``           -- 抓取后奖励机械臂回到初始姿态
 
-.. note::
-    Without a latched grasp flag or a physical attach constraint, "grasping" is evaluated
-    instantaneously each step and the target is not yet rigidly attached to the gripper.
-    See the env-cfg TODOs for upgrading to a true pick-and-carry.
+惩罚项：
+  - ``base_velocity_l2``       -- 罚底盘"到位后还在动"（治绕圈），带到位/对准门控
+  - ``gripper_premature_close`` -- 罚"还没到位就闭爪"（治夹早，和 dwell 配合用）
+
+注意：
+    当前实现中，"抓取"状态在每个时间步瞬时评估，目标物体并未刚性固连到夹爪。
+    未来可升级为带锁定标志的真实拾取-搬运任务（参考 env-cfg 中的 TODO）。
 """
 
 from __future__ import annotations
@@ -19,42 +24,306 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.assets import Articulation, RigidObject
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, RewardTermCfg, SceneEntityCfg
+from isaaclab.utils.math import quat_apply
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
+def _base_center_w(robot: Articulation, base_cfg: SceneEntityCfg) -> torch.Tensor:
+    """底盘几何中心在世界系下的坐标（默认取四个轮子 body 位置的均值）
 
-def _ee_to_target_distance(
-    env: ManagerBasedRLEnv, ee_cfg: SceneEntityCfg, target_cfg: SceneEntityCfg
-) -> torch.Tensor:
-    robot: Articulation = env.scene[ee_cfg.name]
-    target: RigidObject = env.scene[target_cfg.name]
-    ee_pos_w = robot.data.body_pos_w[:, ee_cfg.body_ids[0]]
-    return torch.norm(ee_pos_w - target.data.root_pos_w, dim=1)
+    **为什么不能直接用 root_pos_w**：
+        ``root_pos_w`` 是 base_link 原点，而 base_link 原点由 CAD 导出决定，
+        和底盘几何中心可以差很远。本机器人实测（见 URDF / 仿真里打印的 body 坐标）：
 
+            轮心在 base_link 系 = (-0.333, -0.282, 0.042)
+
+        也就是原点在底盘外面 0.435 m 处。如果拿 root_pos_w 当"底盘位置"：
+
+        1. ``base_to_target_xy_tanh`` 会把这个"幽灵点"拉到目标上，真正的车身
+           反而停在离目标 0.435 m、方位约 130°（左后方）的地方；
+        2. ``base_facing_target`` 算"指向目标的方向"时基点也偏 0.435 m，
+           近距离下方位角误差能有几十度，等距离趋近 0 时方向向量退化成噪声。
+
+        两项合起来的结果就是：训练出来车身的左后方对着目标。所以底盘相关的奖励
+        必须用几何中心，不能用 root 原点。
+
+    Args:
+        robot: 机器人 articulation
+        base_cfg: 指向底盘参考 body 的实体配置，须带 ``body_names``（如 ``"wheel_.*"``）。
+            必须在 RewTerm 的 params 里显式传入，manager 只解析 params 里的 cfg，
+            函数签名里的默认值不会被解析（``body_ids`` 会是 None）。
+
+    Returns:
+        shape (num_envs, 3) 的世界系坐标
+    """
+    return robot.data.body_pos_w[:, base_cfg.body_ids, :].mean(dim=1)
 
 def base_to_target_xy_tanh(
     env: ManagerBasedRLEnv,
     std: float,
+    standoff: float = 0.35,
     robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
     target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    base_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="wheel_.*"),
 ) -> torch.Tensor:
-    """Reward driving the base toward the target in the horizontal (xy) plane."""
+    """奖励底盘在水平面停到目标旁边合适的距离上
+
+    用 tanh 核把"底盘几何中心到目标的水平距离与 standoff 的偏差"映射到 [0, 1]。
+    距离等于 standoff 时奖励最高，越偏离越低。
+
+    位置基点用轮心而不是 root 原点，原因见 :func:`_base_center_w`。
+
+    **关于 standoff**：
+        不能奖励"距离趋近 0"——那是让底盘压到目标上面去，机械臂反而没法伸展。
+        实测零位姿下末端执行器在轮心前方约 0.19 m、高 0.28 m，机械臂还能往前伸，
+        所以底盘中心停在目标外 0.3~0.4 m 比较合适。默认 0.35 m。
+        若想恢复"越近越好"的旧行为，把 standoff 设为 0.0。
+
+    Args:
+        env: 环境实例
+        std: 平滑参数，控制奖励曲线的陡峭程度
+        standoff: 期望的底盘中心到目标的水平距离（米）
+        robot_cfg: 机器人实体配置
+        target_cfg: 目标物体实体配置
+        base_cfg: 底盘参考 body 配置，默认四个轮子
+
+    Returns:
+        shape (num_envs,) 的奖励张量，范围 [0, 1]
+    """
     robot: Articulation = env.scene[robot_cfg.name]
     target: RigidObject = env.scene[target_cfg.name]
-    dist_xy = torch.norm(robot.data.root_pos_w[:, :2] - target.data.root_pos_w[:, :2], dim=1)
-    return 1.0 - torch.tanh(dist_xy / std)
+    base_xy = _base_center_w(robot, base_cfg)[:, :2]
+    dist_xy = torch.norm(base_xy - target.data.root_pos_w[:, :2], dim=1)
+    return 1.0 - torch.tanh((dist_xy - standoff).abs() / std)
 
+def base_facing_target(
+    env: ManagerBasedRLEnv,
+    std: float,
+    forward_axis: tuple[float, float, float] = (0.0, -1.0, 0.0),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    base_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="wheel_.*"),
+) -> torch.Tensor:
+    """奖励底盘正面朝向目标
+
+    以底盘"工作面"（机械臂伸出的方向）与目标方位的夹角为误差，用高斯核给奖励。
+
+    **方位角的基点必须是底盘几何中心，不是 root 原点**（原因见 :func:`_base_center_w`）。
+    本机器人 root 原点在车身外 0.435 m，用它算方位角会有几十度的系统性偏差，
+    且距离趋近 0 时方向向量退化——这是"训练出来左后方对着目标"的直接原因。
+
+    关于 ``forward_axis``：
+        base_link 的坐标轴由 CAD 导出决定，不一定是 +X 朝前。本机器人的四个轮子
+        旋转轴都沿 ±X（见 URDF 的 ``wheel_00*_joint`` 的 ``axis``），说明滚动前进
+        方向是 Y；机械臂基座和末端执行器相对轮心都朝 -Y 伸出，因此工作面是 **-Y**。
+        默认值 (0, -1, 0) 就是这个方向。换机器人或重新导出 URDF 后需要复核。
+
+    为什么用夹角而不是余弦：
+        直接对余弦做 tanh 会在小 std 下严重饱和（std=0.3 时，偏差 60° 得 0.966，
+        完全对齐得 0.998），策略感受不到梯度。改用夹角误差的高斯核，
+        误差越小奖励上升越明显。
+
+    Args:
+        env: 环境实例
+        std: 夹角误差的高斯核宽度（弧度）。0.6 rad ≈ 34°，误差达到 std 时奖励降到 0.37
+        forward_axis: 底盘工作面在 base_link 系中的方向，默认 (0, -1, 0)
+        robot_cfg: 机器人实体配置
+        target_cfg: 目标物体实体配置
+        base_cfg: 底盘参考 body 配置，默认四个轮子
+
+    Returns:
+        shape (num_envs,) 的奖励张量，范围 (0, 1]
+        - 1.0: 工作面正对目标
+        - exp(-1)≈0.37: 偏差等于 std
+        - 趋近 0: 背对目标
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    target: RigidObject = env.scene[target_cfg.name]
+
+    # 把体系下的工作面方向旋转到世界系
+    robot_quat = robot.data.root_quat_w  # (num_envs, 4)
+    axis_b = torch.tensor(forward_axis, device=env.device, dtype=robot_quat.dtype)
+    axis_b = axis_b.unsqueeze(0).expand(robot_quat.shape[0], -1)
+    forward_w = quat_apply(robot_quat, axis_b)  # (num_envs, 3)
+
+    # 投影到水平面（忽略高度差和俯仰）
+    fwd_xy = forward_w[:, :2]
+    fwd_xy = fwd_xy / (torch.norm(fwd_xy, dim=1, keepdim=True) + 1e-6)
+
+    # 方位角从底盘几何中心量起（不是 root 原点）
+    base_center_w = _base_center_w(robot, base_cfg)
+    to_target_xy = (target.data.root_pos_w - base_center_w)[:, :2]
+    to_target_xy = to_target_xy / (torch.norm(to_target_xy, dim=1, keepdim=True) + 1e-6)
+
+    # 用 atan2(叉积z, 点积) 求带符号夹角，范围 [-pi, pi]
+    dot = (fwd_xy * to_target_xy).sum(dim=1)
+    cross_z = fwd_xy[:, 0] * to_target_xy[:, 1] - fwd_xy[:, 1] * to_target_xy[:, 0]
+    heading_err = torch.atan2(cross_z, dot).abs()
+
+    return torch.exp(-torch.square(heading_err / std))
+
+def base_velocity_l2(
+    env: ManagerBasedRLEnv,
+    standoff: float = 0.35,
+    arrive_tol: float = 0.15,
+    align_tol: float = 0.6,
+    ang_vel_scale: float = 0.3,
+    forward_axis: tuple[float, float, float] = (0.0, -1.0, 0.0),
+    robot_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    base_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="wheel_.*"),
+) -> torch.Tensor:
+    """惩罚底盘"到位之后还在动"（水平线速度 + 偏航角速度），带平滑门控
+
+    **为什么需要这一项（现有惩罚项为什么不够）**：
+        1. ``action_rate_l2`` 罚的是动作的**变化量**。底盘匀速绕圈时动作近似恒定，
+           变化量几乎为 0，绕圈基本不花钱，罚不到。
+        2. ``joint_vel_l2`` 目前只作用在机械臂关节上；而且更根本的是
+           :class:`HolonomicBaseAction` 是直接 ``write_root_velocity_to_sim()``
+           写根节点速度的，**完全绕过了轮子关节**——轮子关节速度始终是 0，
+           任何基于关节的惩罚都约束不到底盘运动。
+        3. Isaac Lab 自带的 ``lin_vel_z_l2`` / ``ang_vel_xy_l2`` 管的是竖直方向和
+           翻滚俯仰，不管水平 xy 平移和偏航。
+
+    **为什么底盘会绕圈**：
+        ``base_to_target_xy_tanh`` 在"轮心到目标距离 == standoff"时最大，
+        ``base_facing_target`` 在"工作面指向目标"时最大。这两个条件在
+        **半径 standoff 的整个圆周上都同时满足**——沿切向漂移不损失任何奖励，
+        于是策略就在圆上打转。这一项的作用是打破这个对称性（给"停住"一个理由），
+        而不只是让动作平滑一点。
+
+    **为什么要门控（不能无条件罚速度）**：
+        无条件罚速度会和 ``base_approach`` 直接对抗，策略可能干脆原地不动；
+        而且目标每 2~4 s 会重新随机速度，底盘本来就需要重新追。
+        所以只在"已经到位 **且** 已经对准"时才全力生效：
+
+            gate = exp(-(dist_err/arrive_tol)^2) * exp(-(heading_err/align_tol)^2)
+
+        远处或没对准时 gate≈0（放开让它去追），停好了 gate≈1（罚它别晃）。
+        门控是平滑的高斯核而不是硬阈值，避免在边界上产生奖励断崖。
+
+    Args:
+        env: 环境实例
+        standoff: 期望的底盘中心到目标水平距离（米），应与 ``base_approach`` 保持一致
+        arrive_tol: "到位"判定的高斯核宽度（米），距离偏差超过它 gate 迅速衰减
+        align_tol: "对准"判定的高斯核宽度（弧度），建议与 ``base_facing`` 的 std 一致
+        ang_vel_scale: 偏航角速度平方在惩罚里的相对权重。绕圈主要是切向线速度+偏航，
+            角速度量级通常比线速度大，所以缩小一点，默认 0.3
+        forward_axis: 底盘工作面在 base_link 系中的方向，须与 ``base_facing`` 一致
+        robot_cfg: 机器人实体配置
+        target_cfg: 目标物体实体配置
+        base_cfg: 底盘参考 body 配置，默认四个轮子
+
+    Returns:
+        shape (num_envs,) 的**非负**惩罚量（越大越该罚）。
+        在 env-cfg 里给它配**负权重**，不要在这里取负号。
+    """
+    robot: Articulation = env.scene[robot_cfg.name]
+    target: RigidObject = env.scene[target_cfg.name]
+
+    # ---- 速度项：水平线速度 + 偏航角速度 ----
+    # root_lin_vel_w 是刚体整体速度，底盘是刚性的，用 root 的速度没问题
+    # （root_pos_w 的位置偏移不影响线速度，但会影响旋转带来的那部分——
+    #  绕圈时 root 和轮心的线速度差是 omega × r，这里角速度项已经单独罚了）
+    lin_vel_xy = robot.data.root_lin_vel_w[:, :2]
+    ang_vel_z = robot.data.root_ang_vel_w[:, 2]
+    vel_sq = torch.sum(torch.square(lin_vel_xy), dim=1) + ang_vel_scale * torch.square(ang_vel_z)
+
+    # ---- 门控1：是否已经到位 ----
+    base_center_w = _base_center_w(robot, base_cfg)
+    dist_xy = torch.norm(base_center_w[:, :2] - target.data.root_pos_w[:, :2], dim=1)
+    arrived = torch.exp(-torch.square((dist_xy - standoff) / arrive_tol))
+
+    # ---- 门控2：是否已经对准 ----
+    robot_quat = robot.data.root_quat_w
+    axis_b = torch.tensor(forward_axis, device=env.device, dtype=robot_quat.dtype)
+    axis_b = axis_b.unsqueeze(0).expand(robot_quat.shape[0], -1)
+    fwd_xy = quat_apply(robot_quat, axis_b)[:, :2]
+    fwd_xy = fwd_xy / (torch.norm(fwd_xy, dim=1, keepdim=True) + 1e-6)
+
+    to_target_xy = (target.data.root_pos_w - base_center_w)[:, :2]
+    to_target_xy = to_target_xy / (torch.norm(to_target_xy, dim=1, keepdim=True) + 1e-6)
+
+    dot = (fwd_xy * to_target_xy).sum(dim=1)
+    cross_z = fwd_xy[:, 0] * to_target_xy[:, 1] - fwd_xy[:, 1] * to_target_xy[:, 0]
+    heading_err = torch.atan2(cross_z, dot).abs()
+    aligned = torch.exp(-torch.square(heading_err / align_tol))
+
+    return vel_sq * arrived * aligned
+
+def _grasp_point_w(
+    robot: Articulation,
+    ee_cfg: SceneEntityCfg,
+    grasp_offset: tuple[float, float, float] | None = None,
+) -> torch.Tensor:
+    """真实抓取点在世界系下的坐标
+
+    夹爪是"固定爪 + 活动爪"结构：固定爪(part_034)挂在 link_005 上，活动爪(part_035)
+    挂在 end_effector 上，**真正的抓取点在两爪之间**，不是 end_effector 的 body 原点。
+    实测偏差 (end_effector 局部系) = (-0.0138, -0.0246, -0.0016)，|d| = 0.028 m，
+    主要在前方 2.7 cm。见 assets/eggtart.py 的 EGGTART_EE_GRASP_OFFSET。
+
+    2.8 cm 相对 GRASP_REACH_THRESHOLD=0.05 m 是同一量级，不修的话策略会把
+    body 原点怼到目标上，抓取点其实还在目标后面 2.7 cm，夹爪合上是空的。
+
+    Args:
+        robot: 机器人 articulation
+        ee_cfg: 末端执行器实体配置（须带 body_names）
+        grasp_offset: 抓取点相对 body 原点的偏移，None 表示不偏移（退化为 body 原点）
+
+    Returns:
+        shape (num_envs, 3) 的世界系坐标
+    """
+    ee_pos_w = robot.data.body_pos_w[:, ee_cfg.body_ids[0]]
+    if grasp_offset is None:
+        return ee_pos_w
+    ee_quat_w = robot.data.body_quat_w[:, ee_cfg.body_ids[0]]
+    off = torch.tensor(grasp_offset, device=ee_pos_w.device, dtype=ee_pos_w.dtype)
+    off = off.unsqueeze(0).expand(ee_pos_w.shape[0], -1)
+    return ee_pos_w + quat_apply(ee_quat_w, off)
+
+
+def _ee_to_target_distance(
+    env: ManagerBasedRLEnv,
+    ee_cfg: SceneEntityCfg,
+    target_cfg: SceneEntityCfg,
+    grasp_offset: tuple[float, float, float] | None = None,
+) -> torch.Tensor:
+    """计算**抓取点**到目标的欧氏距离（辅助函数）
+    Args:
+        env: 环境实例
+        ee_cfg: 末端执行器实体配置
+        target_cfg: 目标物体实体配置
+        grasp_offset: 抓取点相对 end_effector body 原点的偏移（局部系）
+    Returns:
+        shape (num_envs,) 的距离张量，单位：米
+    """
+    robot: Articulation = env.scene[ee_cfg.name]
+    target: RigidObject = env.scene[target_cfg.name]
+    grasp_w = _grasp_point_w(robot, ee_cfg, grasp_offset)
+    return torch.norm(grasp_w - target.data.root_pos_w, dim=1)
 
 def ee_to_target_tanh(
     env: ManagerBasedRLEnv,
     std: float,
     ee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="end_effector"),
     target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    grasp_offset: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
-    """Reward reaching the end-effector to the target (tanh kernel)."""
-    dist = _ee_to_target_distance(env, ee_cfg, target_cfg)
+    """奖励抓取点接近目标（使用 tanh 核）
+    三维空间距离越近，奖励越高。
+    Args:
+        env: 环境实例
+        std: 平滑参数
+        ee_cfg: 末端执行器实体配置
+        target_cfg: 目标物体实体配置
+        grasp_offset: 抓取点相对 end_effector body 原点的偏移（局部系）
+    Returns:
+        shape (num_envs,) 的奖励张量，范围 [0, 1]
+    """
+    dist = _ee_to_target_distance(env, ee_cfg, target_cfg, grasp_offset)
     return 1.0 - torch.tanh(dist / std)
 
 
@@ -62,9 +331,19 @@ def ee_to_target_distance_l2(
     env: ManagerBasedRLEnv,
     ee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="end_effector"),
     target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    grasp_offset: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
-    """L2 distance from end-effector to target (use with a negative weight)."""
-    return _ee_to_target_distance(env, ee_cfg, target_cfg)
+    """返回抓取点到目标的 L2 距离（配合负权重使用）
+    直接返回距离值，通常配合负权重作为惩罚项。
+    Args:
+        env: 环境实例
+        ee_cfg: 末端执行器实体配置
+        target_cfg: 目标物体实体配置
+        grasp_offset: 抓取点相对 end_effector body 原点的偏移（局部系）
+    Returns:
+        shape (num_envs,) 的距离张量，单位：米
+    """
+    return _ee_to_target_distance(env, ee_cfg, target_cfg, grasp_offset)
 
 
 def grasp_bonus(
@@ -74,10 +353,28 @@ def grasp_bonus(
     ee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="end_effector"),
     gripper_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["end_effector_joint"]),
     target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    grasp_offset: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
-    """Bonus (1.0) when the EE is within ``reach_threshold`` AND the gripper joint is closed."""
+    """抓取奖励：当抓取点接近目标且夹爪闭合时给予 1.0 奖励
+    两个条件同时满足时触发：
+    1. 抓取点距离目标 < reach_threshold
+    2. 夹爪关节角度 < gripper_closed_threshold（闭合状态）
+
+    **注意 gripper_closed_threshold 必须在关节硬限位之内**，否则条件恒不成立、
+    本项恒为 0。end_effector_joint 的硬限位是 (-0.2, 1.57)，所以阈值必须 > -0.2。
+    Args:
+        env: 环境实例
+        reach_threshold: 到达阈值（米）
+        gripper_closed_threshold: 夹爪闭合角度阈值（弧度）
+        ee_cfg: 末端执行器实体配置
+        gripper_cfg: 夹爪关节实体配置
+        target_cfg: 目标物体实体配置
+        grasp_offset: 抓取点相对 end_effector body 原点的偏移（局部系）
+    Returns:
+        shape (num_envs,) 的奖励张量，0 或 1
+    """
     robot: Articulation = env.scene[ee_cfg.name]
-    dist = _ee_to_target_distance(env, ee_cfg, target_cfg)
+    dist = _ee_to_target_distance(env, ee_cfg, target_cfg, grasp_offset)
     gripper_pos = robot.data.joint_pos[:, gripper_cfg.joint_ids[0]]
     is_near = dist < reach_threshold
     is_closed = gripper_pos < gripper_closed_threshold
@@ -93,10 +390,28 @@ def retract_bonus(
     ee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="end_effector"),
     gripper_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["end_effector_joint"]),
     target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    grasp_offset: tuple[float, float, float] | None = None,
 ) -> torch.Tensor:
-    """Once "grasping", reward the arm joints returning to their home (default) pose."""
+    """回收奖励：抓取成功后，奖励机械臂回到初始姿态
+    只有在"正在抓取"状态下（抓取点接近目标且夹爪闭合）才给予奖励。
+    奖励值与机械臂关节偏离初始姿态的距离成反比。
+
+    **依赖 gripper_closed_threshold 可达**，见 :func:`grasp_bonus` 的说明。
+    Args:
+        env: 环境实例
+        reach_threshold: 到达阈值（米）
+        gripper_closed_threshold: 夹爪闭合角度阈值（弧度）
+        std: 平滑参数
+        arm_cfg: 机械臂关节实体配置
+        ee_cfg: 末端执行器实体配置
+        gripper_cfg: 夹爪关节实体配置
+        target_cfg: 目标物体实体配置
+        grasp_offset: 抓取点相对 end_effector body 原点的偏移（局部系）
+    Returns:
+        shape (num_envs,) 的奖励张量，范围 [0, 1](非抓取状态为0)
+    """
     robot: Articulation = env.scene[arm_cfg.name]
-    dist = _ee_to_target_distance(env, ee_cfg, target_cfg)
+    dist = _ee_to_target_distance(env, ee_cfg, target_cfg, grasp_offset)
     gripper_pos = robot.data.joint_pos[:, gripper_cfg.joint_ids[0]]
     grasping = (dist < reach_threshold) & (gripper_pos < gripper_closed_threshold)
 
@@ -104,3 +419,123 @@ def retract_bonus(
     arm_home = robot.data.default_joint_pos[:, arm_cfg.joint_ids]
     home_err = torch.norm(arm_pos - arm_home, dim=1)
     return grasping.float() * (1.0 - torch.tanh(home_err / std))
+
+
+class grasp_bonus_dwell(ManagerTermBase):
+    """抓取奖励（带停留计时）：抓取点在阈值内**连续停留**足够久后，闭合夹爪才算有效
+
+    **为什么需要计时**：
+        原来的 :func:`grasp_bonus` 是逐步瞬时判定的：只要"这一帧"抓取点进了
+        reach_threshold 且夹爪闭合就给奖励。策略于是学会一边冲向目标一边提前闭爪——
+        因为闭爪本身零成本，早闭一点还能提高"恰好在某一帧同时满足两个条件"的概率。
+        结果就是夹爪夹早了，还没稳定对准就合上，实际抓不到东西。
+
+        加上"连续停留 dwell_time 秒"的门槛后，提前闭爪不再有收益：奖励只在
+        抓取点已经稳定停在目标上之后才生效，策略必须先对准、稳住，再闭爪。
+
+    **计数器语义**：
+        每个 env 维护一个 ``_dwell_steps`` 计数器（单位：env step，不是物理 step）。
+        抓取点在阈值内则 +1，一旦离开阈值立刻**归零**（要求"连续"，不是"累计"）。
+        这就是为什么必须写成类：需要跨 step 的 per-env 状态，而且状态要能在
+        episode 重置时清掉 —— RewardManager 会对类式项自动调用 ``reset(env_ids)``。
+
+    **和 grasp_bonus 的区别**：
+        除了计时，本项还把奖励做成了软的：满足条件时返回 1.0，
+        并且在停留时间还没攒够时返回 0（不给部分奖励，避免又变成"早闭爪也有点分"）。
+    """
+
+    def __init__(self, cfg: RewardTermCfg, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        # per-env 的连续停留步数计数器
+        self._dwell_steps = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+        # 把 dwell_time(秒) 换算成 env step 数；env.step_dt = sim.dt * decimation
+        dwell_time = cfg.params.get("dwell_time", 0.3)
+        self._dwell_steps_required = max(1, int(round(dwell_time / env.step_dt)))
+        print(
+            f"[grasp_bonus_dwell] dwell_time={dwell_time}s, step_dt={env.step_dt:.4f}s"
+            f" -> 需要连续 {self._dwell_steps_required} 个 env step 在阈值内"
+        )
+
+    def reset(self, env_ids: torch.Tensor | None = None) -> None:
+        """episode 重置时清掉计数器（由 RewardManager 自动调用）"""
+        if env_ids is None:
+            self._dwell_steps.zero_()
+        else:
+            self._dwell_steps[env_ids] = 0
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        reach_threshold: float,
+        gripper_closed_threshold: float,
+        dwell_time: float = 0.6,
+        ee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="end_effector"),
+        gripper_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["end_effector_joint"]),
+        target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+        grasp_offset: tuple[float, float, float] | None = None,
+    ) -> torch.Tensor:
+        """
+        Args:
+            env: 环境实例
+            reach_threshold: 到达阈值（米），抓取点到目标的距离小于它算"在位"
+            gripper_closed_threshold: 夹爪闭合角度阈值（弧度），必须 > -0.2（硬限位）
+            dwell_time: 需要连续停留的时间（秒）。只在 __init__ 里读，改它要重建环境
+            ee_cfg: 末端执行器实体配置
+            gripper_cfg: 夹爪关节实体配置
+            target_cfg: 目标物体实体配置
+            grasp_offset: 抓取点相对 end_effector body 原点的偏移（局部系）
+
+        Returns:
+            shape (num_envs,) 的奖励张量，0 或 1
+        """
+        robot: Articulation = env.scene[ee_cfg.name]
+        dist = _ee_to_target_distance(env, ee_cfg, target_cfg, grasp_offset)
+        is_near = dist < reach_threshold
+
+        # 连续停留：在阈值内 +1，离开就归零
+        self._dwell_steps = torch.where(
+            is_near, self._dwell_steps + 1, torch.zeros_like(self._dwell_steps)
+        )
+        dwelled = self._dwell_steps >= self._dwell_steps_required
+
+        gripper_pos = robot.data.joint_pos[:, gripper_cfg.joint_ids[0]]
+        is_closed = gripper_pos < gripper_closed_threshold
+
+        return (dwelled & is_closed).float()
+
+
+def gripper_premature_close(
+    env: ManagerBasedRLEnv,
+    reach_threshold: float,
+    gripper_closed_threshold: float,
+    ee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="end_effector"),
+    gripper_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["end_effector_joint"]),
+    target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    grasp_offset: tuple[float, float, float] | None = None,
+) -> torch.Tensor:
+    """惩罚"还没到位就闭爪"（治夹爪夹早了）
+
+    只加停留计时是"不给奖励"，属于消极约束——提前闭爪虽然拿不到分，但也不亏，
+    策略仍可能保持闭爪的习惯（尤其闭爪几乎不花动作代价）。本项主动给它记上一笔：
+    抓取点还在 reach_threshold **之外**、夹爪却是闭合的，就返回 1。
+
+    配负权重使用。这样"张着爪接近、到位稳住后再闭合"才是最优策略。
+
+    Args:
+        env: 环境实例
+        reach_threshold: 到达阈值（米）
+        gripper_closed_threshold: 夹爪闭合角度阈值（弧度）
+        ee_cfg: 末端执行器实体配置
+        gripper_cfg: 夹爪关节实体配置
+        target_cfg: 目标物体实体配置
+        grasp_offset: 抓取点相对 end_effector body 原点的偏移（局部系）
+
+    Returns:
+        shape (num_envs,) 的**非负**惩罚量（0 或 1），在 env-cfg 里配负权重
+    """
+    robot: Articulation = env.scene[ee_cfg.name]
+    dist = _ee_to_target_distance(env, ee_cfg, target_cfg, grasp_offset)
+    gripper_pos = robot.data.joint_pos[:, gripper_cfg.joint_ids[0]]
+    is_far = dist >= reach_threshold
+    is_closed = gripper_pos < gripper_closed_threshold
+    return (is_far & is_closed).float()

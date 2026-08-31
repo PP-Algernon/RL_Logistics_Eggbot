@@ -3,8 +3,8 @@
   <link name="base_link">
     <inertial>
       <origin xyz="-0.33264187 -0.29860758 0.09670448" rpy="0 0 0"/>
-      <mass value="1.23694208"/>
-      <inertia ixx="0.01206414" ixy="-0.0000818" ixz="0.0000154" iyy="0.00832861" iyz="0.00111197" izz="0.01517748"/>
+      <mass value="8.0"/>
+      <inertia ixx="0.07806088" ixy="-0.0005294" ixz="0.0000997" iyy="0.05389959" iyz="0.00719451" izz="0.09823182"/>
     </inertial>
     <visual name="part_001_visual_1">
       <origin xyz="0 0 0" rpy="1.57079633 0 0"/>
@@ -379,30 +379,30 @@
   </link>
   <link name="wheel_001">
     <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0"/>
-      <mass value="1"/>
-      <inertia ixx="0.001" ixy="0" ixz="0" iyy="0.001" iyz="0" izz="0.001"/>
-    </inertial>
-  </link>
-  <link name="wheel_002">
-    <inertial>
-      <origin xyz="-0.07797377 0.00211898 0.00120137" rpy="0 0 0"/>
-      <mass value="0.16388837"/>
-      <inertia ixx="0.00017764" ixy="0.00004323" ixz="0.00002371" iyy="0.00173797" iyz="-6.3e-7" izz="0.00173896"/>
+      <origin xyz="-0.02161192 0.000764 0.00040817" rpy="0 0 0"/>
+      <mass value="0.0819442"/>
+      <inertia ixx="0.00008922" ixy="0" ixz="0" iyy="0.00005705" iyz="0" izz="0.00005702"/>
     </inertial>
     <visual name="part_045_visual_1">
-      <origin xyz="0.25776064 0.37917681 -0.04077422" rpy="1.57079633 0 0"/>
+      <origin xyz="0.41368571 0.37495453 -0.04313689" rpy="1.57079633 0 0"/>
       <geometry><mesh filename="meshes/part_045_solid_045.stl" scale="0.001 0.001 0.001"/></geometry>
     </visual>
     <collision name="part_045_collision_1">
-      <origin xyz="0.25776064 0.37917681 -0.04077422" rpy="1.57079633 0 0"/>
+      <origin xyz="0.41368571 0.37495453 -0.04313689" rpy="1.57079633 0 0"/>
       <geometry><mesh filename="meshes/part_045_solid_045.stl" scale="0.001 0.001 0.001"/></geometry>
     </collision>
-    <visual name="part_042_visual_2">
+  </link>
+  <link name="wheel_002">
+    <inertial>
+      <origin xyz="0.02160055 -0.00072192 -0.00043163" rpy="0 0 0"/>
+      <mass value="0.08194418"/>
+      <inertia ixx="0.00008722" ixy="0" ixz="0" iyy="0.00005591" iyz="0" izz="0.00005613"/>
+    </inertial>
+    <visual name="part_042_visual_1">
       <origin xyz="0.25776064 0.37917681 -0.04077422" rpy="1.57079633 0 0"/>
       <geometry><mesh filename="meshes/part_042_solid_042.stl" scale="0.001 0.001 0.001"/></geometry>
     </visual>
-    <collision name="part_042_collision_2">
+    <collision name="part_042_collision_1">
       <origin xyz="0.25776064 0.37917681 -0.04077422" rpy="1.57079633 0 0"/>
       <geometry><mesh filename="meshes/part_042_solid_042.stl" scale="0.001 0.001 0.001"/></geometry>
     </collision>
@@ -449,21 +449,21 @@
     <child link="link_002"/>
     <origin xyz="-0.03525838 -0.0295927 0.05273859" rpy="0 0 0"/>
     <axis xyz="-0.99948339 0.02834748 0.01514483"/>
-    <limit lower="-3.14" upper="1.57" effort="10" velocity="5"/>
+    <limit lower="-3.92" upper="0.0" effort="10" velocity="5"/>
   </joint>
   <joint name="link_003_joint" type="revolute">
     <parent link="link_002"/>
     <child link="link_003"/>
     <origin xyz="0.02017989 0.11526324 0.00673779" rpy="0 0 0"/>
     <axis xyz="-0.99948339 0.02834748 0.01514483"/>
-    <limit lower="-1.57" upper="1.57" effort="10" velocity="5"/>
+    <limit lower="0.0" upper="3.14" effort="10" velocity="5"/>
   </joint>
   <joint name="link_004_joint" type="revolute">
     <parent link="link_003"/>
     <child link="link_004"/>
     <origin xyz="-0.00335283 -0.13234243 0.02644312" rpy="0 0 0"/>
     <axis xyz="0.99948339 -0.02834748 -0.01514483"/>
-    <limit lower="-1.57" upper="1.57" effort="10" velocity="5"/>
+    <limit lower="-3.14" upper="0.0" effort="10" velocity="5"/>
   </joint>
   <joint name="link_005_joint" type="revolute">
     <parent link="link_004"/>
@@ -477,7 +477,7 @@
     <child link="end_effector"/>
     <origin xyz="0.02012105 0.00990319 -0.02443584" rpy="0 0 0"/>
     <axis xyz="-0.020545 -0.92590361 0.37720076"/>
-    <limit lower="-1.57" upper="1.57" effort="10" velocity="5"/>
+    <limit lower="-0.2" upper="1.57" effort="10" velocity="5"/>
   </joint>
   <joint name="wheel_001_joint" type="continuous">
     <parent link="base_link"/>

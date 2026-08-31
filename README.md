@@ -58,6 +58,7 @@ cd /home/pu/isaac-lab
 cd /home/pu/isaac-lab
 ./isaaclab.sh -p /home/pu/RL-ws/ProjectLearning/Eggtart-logistics-robot/scripts/rsl_rl/train.py \
     --task=Isaac-Mobile-Grasp-Eggtart-v0 \
+    --max_iterations 2000 \
     --num_envs=2048 \
     --headless
 ```
