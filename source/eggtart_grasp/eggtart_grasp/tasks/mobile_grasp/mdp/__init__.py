@@ -2,7 +2,7 @@
 
 from isaaclab.envs.mdp import *  # noqa: F401, F403
 
-from .actions import MecanumBaseAction, MecanumBaseActionCfg, HolonomicBaseAction, HolonomicBaseActionCfg  # noqa: F401
+from .actions import MecanumBaseAction, MecanumBaseActionCfg, HolonomicBaseAction, HolonomicBaseActionCfg, GripperForceAction, GripperForceActionCfg  # noqa: F401
 from .curriculums import reward_weight_schedule  # noqa: F401
 from .observations import *  # noqa: F401, F403
 from .rewards import *  # noqa: F401, F403

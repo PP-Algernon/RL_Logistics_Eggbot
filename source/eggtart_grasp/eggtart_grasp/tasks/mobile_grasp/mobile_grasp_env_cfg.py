@@ -35,23 +35,28 @@ from eggtart_grasp.assets.eggtart import (
 )
 
 # ---------------------------------------------------------------------------
-# Tunable task constants (TODO tune)
+# Tunable task constants
 # ---------------------------------------------------------------------------
-GRASP_REACH_THRESHOLD = 0.05      # m -- 抓取点落在这个距离内算"到达目标"
+# 抓取点落在这个距离内算"到达目标"
+# 调整建议：如果EE一直到不了，可以放宽到0.08甚至0.10；等学会了再收紧
+GRASP_REACH_THRESHOLD = 0.08      # m (放宽让policy更容易触发grasp)
 
-# rad -- 夹爪关节低于此角度算"闭合"。
-# **必须在 end_effector_joint 的硬限位 (-0.2, 1.57) 之内**，否则条件恒不成立、
-# grasp_bonus 和 retract_bonus 永远返回 0，阶段3/4 的奖励整体失效。
-# 旧值 -0.6 就是这个 bug（实测命令夹爪全力闭合 120 步，关节只到 -0.2000）。
-# -0.15 留了一点余量：闭到底是 -0.2，PD 控制下稳态略有静差。
-GRIPPER_CLOSED_THRESHOLD = -0.15
+# 夹爪关节低于此角度算"闭合"
+#
+# **改成力控后这个值必须跟着改**：位置控制时空夹能压到硬限位 -0.2，所以阈值 -0.15
+# 合理；但力控下夹住物体时夹爪**被物体挡住**，根本到不了 -0.2——
+# 实测 30 mm 立方体停在 q≈0.29，40 mm 停在 q≈0.40。
+# 如果还用 -0.15，"夹住了"这个条件永远不成立，grasp / retract 奖励恒为 0。
+#
+# 0.35 的依据：目标立方体 30 mm 停在 0.29，留一点余量；同时 0.35 对应开口约 44 mm，
+# 比物体宽——也就是"明显在往里夹但还没夹到"不会误判成已闭合。
+# 换目标尺寸要重算：开口-角度对应关系见 assets/eggtart.py 的注释表。
+GRIPPER_CLOSED_THRESHOLD = 0.35
 
-# s -- 抓取点必须在 GRASP_REACH_THRESHOLD 内**连续停留**这么久，闭爪才算有效抓取。
-# 治"夹爪夹早了"：瞬时判定下策略会边冲向目标边提前闭爪（闭爪零成本，早闭还能提高
-# "某一帧恰好同时满足到位+闭合"的概率）。加了停留门槛后必须先对准稳住再闭合。
-# env.step_dt = sim.dt * decimation = (1/120) * 4 = 1/30 s，所以 0.3 s ≈ 9 个 env step。
-# 调大 -> 要求停得更稳，但学习更难（稀疏奖励更稀疏）；episode 只有 10 s，别设太大。
-GRASP_DWELL_TIME = 0.6
+# 抓取点必须在 GRASP_REACH_THRESHOLD 内**连续停留**这么久，闭爪才算有效抓取
+# env.step_dt = (1/120) * 4 = 1/30 s，所以 0.3 s ≈ 9 步，0.6 s ≈ 18 步
+# 调整建议：如果grasp一直是0，先降到0.2让policy能拿到奖励，再逐步提高要求
+GRASP_DWELL_TIME = 0.2  # s (降低难度，让policy先学会基本动作)
 
 
 ##
@@ -74,7 +79,7 @@ class MobileGraspSceneCfg(InteractiveSceneCfg):
     target = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Target",
         spawn=sim_utils.CuboidCfg(
-            size=(0.02, 0.02, 0.02),
+            size=(0.03, 0.03, 0.03),
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=True,
                 linear_damping=0.0,
@@ -113,11 +118,16 @@ class ActionsCfg:
         scale=0.5,
         use_default_offset=True,
     )
-    gripper_action = mdp.JointPositionActionCfg(
+    # 夹爪改为**力控**：策略输出夹持力，最终停在哪由接触自然决定，自适应物体体积。
+    # 位置控制下策略必须精确命令一个关节角，而"物体多大就该停在哪个角度"是几何决定的
+    # （实测 20/30/40 mm 物体分别停在 q=0.116/0.290/0.400），位置控制要么闭不到位、
+    # 要么把物体挤穿。详见 actions.py 的 GripperForceAction。
+    # max_effort 实测：0.3 Nm 能稳定夹住 30 mm 立方体，3.0 Nm 会把它挤穿。
+    gripper_action = mdp.GripperForceActionCfg(
         asset_name="robot",
         joint_names=[EGGTART_GRIPPER_JOINT_NAME],
-        scale=1.0,
-        use_default_offset=True,
+        max_effort=1.0,
+        damping=0.05,
     )
 
 
@@ -262,6 +272,21 @@ class RewardsCfg:
     # 早闭还能提高"某一帧恰好同时满足两条件"的概率，于是夹爪总是夹早了。
     # 计数器是 per-env 的，离开阈值立刻归零（要求连续，不是累计），
     # episode 重置时由 RewardManager 自动清零（类式奖励项才有这个能力）。
+
+    # 引导奖励：接近目标时鼓励闭合夹爪（稠密奖励，帮助policy学会基本动作）
+    gripper_close_guide = RewTerm(
+        func=mdp.gripper_close_when_near,
+        weight=2.0,  # 稠密引导，在grasp之前帮助policy建立"靠近->闭合"的关联
+        params={
+            "reach_threshold": GRASP_REACH_THRESHOLD,
+            "ee_cfg": SceneEntityCfg("robot", body_names="end_effector"),
+            "gripper_cfg": SceneEntityCfg("robot", joint_names=[EGGTART_GRIPPER_JOINT_NAME]),
+            "target_cfg": SceneEntityCfg("target"),
+            "grasp_offset": EGGTART_EE_GRASP_OFFSET,
+        },
+    )
+
+    # 稀疏抓取奖励（最终目标，需要停留+闭合）
     grasp = RewTerm(
         func=mdp.grasp_bonus_dwell,
         weight=5.0,
@@ -394,34 +419,41 @@ class CurriculumCfg:
         func=mdp.reward_weight_schedule,
         params={"term_name": "base_facing", "schedule": [(0, 1.0)]},
     )
-    # 末端执行器：阶段 2 打开
+    # 末端执行器：阶段 2 打开（提前到iter 250，让EE更早开始学习）
     ee_reach_sched = CurrTerm(
         func=mdp.reward_weight_schedule,
-        params={"term_name": "ee_reach", "schedule": [(0, 0.0), (12000, 3.0)]},
+        params={"term_name": "ee_reach", "schedule": [(0, 0.0), (9000, 5.0)]},  # 9000步≈iter 375，权重5.0加大引导
     )
     ee_distance_sched = CurrTerm(
         func=mdp.reward_weight_schedule,
-        params={"term_name": "ee_distance", "schedule": [(0, 0.0), (12000, -0.2)]},
+        params={"term_name": "ee_distance", "schedule": [(0, 0.0), (9000, -0.2)]},
     )
-    # 抓取和回收：阶段 3 打开
+
+    # 引导奖励：在ee_reach之后、grasp之前启用，帮助policy学会"接近->闭合"
+    gripper_close_guide_sched = CurrTerm(
+        func=mdp.reward_weight_schedule,
+        params={"term_name": "gripper_close_guide", "schedule": [(0, 0.0), (9000, 2.0)]}, 
+    )
+
+    # 抓取和回收：阶段 3 打开（提前到iter 500）
     grasp_sched = CurrTerm(
         func=mdp.reward_weight_schedule,
-        params={"term_name": "grasp", "schedule": [(0, 0.0), (24000, 5.0)]},
+        params={"term_name": "grasp", "schedule": [(0, 0.0), (12000, 10.0)]},  # 12000步≈iter 500，权重10.0让grasp更有吸引力
     )
-    # "提前闭爪"的惩罚和 grasp 同步打开：早于 grasp 会让策略学会死张着爪不动
+    # "提前闭爪"的惩罚和 grasp 同步打开，但权重降低避免过度抑制
     gripper_early_sched = CurrTerm(
         func=mdp.reward_weight_schedule,
-        params={"term_name": "gripper_early", "schedule": [(0, 0.0), (24000, -0.01)]},
+        params={"term_name": "gripper_early", "schedule": [(0, 0.0), (12000, -0.005)]},  # 降到-0.005，让policy敢尝试夹
     )
     retract_sched = CurrTerm(
         func=mdp.reward_weight_schedule,
-        params={"term_name": "retract", "schedule": [(0, 0.0), (24000, 2.0)]},
+        params={"term_name": "retract", "schedule": [(0, 0.0), (30000, 2.0)]},
     )
     # 底盘速度惩罚：延后到 step 3000（≈iter 125）再打开。
     # 一开始底盘还不会走，就罚它动会拖慢学习；等它大致学会接近了再要求"停住"。
     base_vel_sched = CurrTerm(
         func=mdp.reward_weight_schedule,
-        params={"term_name": "base_vel", "schedule": [(0, 0.0), (3000, -0.05)]},
+        params={"term_name": "base_vel", "schedule": [(0, 0.0), (9000, -0.05)]},
     )
     # 关节限位惩罚全程开启：从一开始就不该往限位上顶
     joint_limits_sched = CurrTerm(

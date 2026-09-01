@@ -539,3 +539,55 @@ def gripper_premature_close(
     is_far = dist >= reach_threshold
     is_closed = gripper_pos < gripper_closed_threshold
     return (is_far & is_closed).float()
+
+
+def gripper_close_when_near(
+    env: ManagerBasedRLEnv,
+    reach_threshold: float,
+    ee_cfg: SceneEntityCfg = SceneEntityCfg("robot", body_names="end_effector"),
+    gripper_cfg: SceneEntityCfg = SceneEntityCfg("robot", joint_names=["end_effector_joint"]),
+    target_cfg: SceneEntityCfg = SceneEntityCfg("target"),
+    grasp_offset: tuple[float, float, float] | None = None,
+    gripper_open_pos: float = 1.0,
+    gripper_full_close_pos: float = 0.35,
+) -> torch.Tensor:
+    """奖励"接近目标时闭合夹爪"（引导性稠密奖励，帮助policy学会基本抓取动作）
+
+    这是一个稠密引导奖励，在 grasp_bonus_dwell（稀疏）之前使用。
+    当抓取点接近目标时，闭合程度越高奖励越大，鼓励策略学会"靠近 -> 闭合"的动作序列。
+
+    **力控下的归一化要点**：
+        夹爪改成力控后，夹住物体时关节**到不了硬限位**（被物体挡住）。
+        实测 30 mm 立方体停在 q≈0.29。如果还按"闭到 -0.2 才算满分"归一化，
+        策略把物体夹稳了也只能拿到约 59% 的分，白白留下一截拿不到的奖励，
+        梯度会一直推着它加大夹持力去挤物体。
+        所以满分点用 ``gripper_full_close_pos``（默认 0.35，与
+        ``GRIPPER_CLOSED_THRESHOLD`` 对齐），夹到该角度即视为完全闭合。
+
+    Args:
+        env: 环境实例
+        reach_threshold: 距离阈值（米），在这个距离内算"接近"
+        ee_cfg, gripper_cfg, target_cfg: 实体配置
+        grasp_offset: 抓取点相对 end_effector body 原点的偏移
+        gripper_open_pos: 夹爪完全张开的关节角（奖励 0 的那一端）
+        gripper_full_close_pos: 视为"完全闭合"的关节角（奖励 1 的那一端）
+
+    Returns:
+        shape (num_envs,)，范围 [0, 1]
+        - 接近目标 且 夹爪闭合 -> 1.0
+        - 接近目标 但 夹爪打开 -> 0.0
+        - 远离目标 -> 0.0
+    """
+    robot: Articulation = env.scene[ee_cfg.name]
+
+    # 距离门控：只在接近时才鼓励闭合
+    dist = _ee_to_target_distance(env, ee_cfg, target_cfg, grasp_offset)
+    proximity = torch.exp(-torch.square(dist / (reach_threshold * 0.5)))
+
+    # 闭合程度归一化到 [0, 1]：open -> 0，full_close -> 1
+    gripper_pos = robot.data.joint_pos[:, gripper_cfg.joint_ids[0]]
+    span = max(gripper_open_pos - gripper_full_close_pos, 1e-6)
+    close_amount = torch.clamp((gripper_open_pos - gripper_pos) / span, 0.0, 1.0)
+
+    return proximity * close_amount
+

@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import field
 from typing import TYPE_CHECKING
 
@@ -31,7 +32,7 @@ from isaaclab.utils import configclass
 from isaaclab.utils.math import quat_apply
 
 if TYPE_CHECKING:
-    from isaaclab.envs import ManagerBasedRLEnv
+    from isaaclab.envs import ManagerBasedEnv, ManagerBasedRLEnv
 
 
 class MecanumBaseAction(ActionTerm):
@@ -247,3 +248,120 @@ class HolonomicBaseActionCfg(ActionTermCfg):
 
     max_ang_vel_z: float = 1.5
     """Max yaw rate (rad/s)."""
+
+
+class GripperForceAction(ActionTerm):
+    """夹爪力控动作项：策略输出夹持力，夹爪自动贴合物体体积
+
+    **为什么要力控**
+        位置控制下策略必须精确命令一个关节角。物体多大就该停在哪个角度是几何决定的
+        （实测：20 mm 物体停 q=0.116，30 mm 停 q=0.290，40 mm 停 q=0.400），
+        位置控制要么闭不到位、要么把物体挤穿。力控只给"多大的力"，最终停在哪
+        由接触自然决定，换个尺寸的物体不用重训。
+
+    **实现原理**
+        ImplicitActuator 下 PhysX 的关节力矩为::
+
+            tau = stiffness * (q_target - q) + damping * (qd_target - qd) + effort_target
+
+        所以把该关节的 ``stiffness`` 置 0 就退化成"阻尼 + 力矩指令"，即力控。
+        本项在 ``__init__`` 里直接改仿真中的增益（``write_joint_stiffness_to_sim``），
+        因此 asset 配置里 gripper 那组 actuator 的 stiffness 写什么都会被覆盖。
+
+        保留一点 ``damping``（默认 0.05）很关键：完全没有阻尼时关节在无接触段会被
+        恒力矩不断加速，撞上物体时冲击过大，实测会把立方体挤穿。
+
+    **动作语义**
+        原始动作 ``a`` 先 clamp 到 [-1, 1]，再映射成力矩::
+
+            tau = a * max_effort      (a<0 闭合，a>0 张开)
+
+        实测合理夹持力矩是 0.3~1.0 Nm：0.3 Nm 能夹住 30 mm 立方体停在 q≈0.29，
+        3.0 Nm 会把立方体挤穿一路闭到硬限位 -0.2。所以 ``max_effort`` 默认 1.0。
+
+    **注意**
+        力控下"夹爪角度低于阈值算闭合"这类判据仍然可用，但夹住物体时角度**不会**
+        到硬限位（被物体挡住）。所以 ``GRIPPER_CLOSED_THRESHOLD`` 必须比
+        "夹住目标物体时的稳定角度"更**大**，否则 grasp 奖励永远拿不到。
+        30 mm 物体停在 q≈0.29，阈值应设在 0.29 以上（例如 0.35）。
+    """
+
+    cfg: GripperForceActionCfg
+
+    def __init__(self, cfg: GripperForceActionCfg, env: ManagerBasedEnv):
+        super().__init__(cfg, env)
+        self._asset: Articulation = env.scene[cfg.asset_name]
+
+        self._joint_ids, self._joint_names = self._asset.find_joints(cfg.joint_names)
+        if len(self._joint_ids) == 0:
+            raise ValueError(f"GripperForceAction 找不到关节: {cfg.joint_names}")
+
+        self._raw_actions = torch.zeros(env.num_envs, self.action_dim, device=env.device)
+        self._processed_actions = torch.zeros(env.num_envs, self.action_dim, device=env.device)
+
+        # 关掉位置增益 -> 纯力矩控制；留一点阻尼避免无接触段被恒力矩加速到冲击过大
+        n = len(self._joint_ids)
+        zeros = torch.zeros(env.num_envs, n, device=env.device)
+        self._asset.write_joint_stiffness_to_sim(zeros, joint_ids=self._joint_ids)
+        self._asset.write_joint_damping_to_sim(
+            zeros + cfg.damping, joint_ids=self._joint_ids
+        )
+        print(
+            f"[GripperForceAction] 关节 {self._joint_names} 切换为力控:"
+            f" stiffness=0, damping={cfg.damping}, max_effort={cfg.max_effort} Nm"
+        )
+
+    @property
+    def action_dim(self) -> int:
+        return len(self._joint_ids)
+
+    @property
+    def raw_actions(self) -> torch.Tensor:
+        return self._raw_actions
+
+    @property
+    def processed_actions(self) -> torch.Tensor:
+        return self._processed_actions
+
+    def process_actions(self, actions: torch.Tensor) -> None:
+        self._raw_actions = actions.clone()
+        # a<0 闭合，a>0 张开
+        self._processed_actions = torch.clamp(actions, -1.0, 1.0) * self.cfg.max_effort
+
+    def apply_actions(self) -> None:
+        self._asset.set_joint_effort_target(
+            self._processed_actions, joint_ids=self._joint_ids
+        )
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        if env_ids is None:
+            self._raw_actions.zero_()
+            self._processed_actions.zero_()
+        else:
+            self._raw_actions[env_ids] = 0.0
+            self._processed_actions[env_ids] = 0.0
+
+
+@configclass
+class GripperForceActionCfg(ActionTermCfg):
+    """:class:`GripperForceAction` 的配置"""
+
+    class_type: type[ActionTerm] = GripperForceAction
+
+    asset_name: str = "robot"
+    """场景中 articulation 资产的名字"""
+
+    joint_names: list[str] = field(default_factory=lambda: ["end_effector_joint"])
+    """夹爪关节名（支持正则）"""
+
+    max_effort: float = 1.0
+    """动作 ±1 对应的力矩上限（Nm）
+
+    实测参考（30 mm 立方体）：0.3 Nm 稳定停在 q≈0.29；3.0 Nm 会把物体挤穿。
+    """
+
+    damping: float = 0.05
+    """力控下保留的关节阻尼
+
+    不能为 0：无接触段恒力矩会把关节持续加速，撞上物体时冲击过大。
+    """
